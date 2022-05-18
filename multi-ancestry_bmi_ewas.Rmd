@@ -1,0 +1,223 @@
+---
+title: "Multi-Ethnic BMI EWAS "
+author: "Kendra Ferrier"
+date: "`r format(Sys.time(), '%m/%d/%y')`"
+output:
+  html_document:
+    theme: cosmo
+---
+
+```{r Setup, include=TRUE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = "hide")
+library(tidyr)
+library(tidyverse)
+library(haven)
+library(dplyr)
+library(tibble)
+library(readr)
+library(data.table)
+library(sesame)
+library(purrr)
+library(furrr)
+library(bacon)
+library(tictoc)
+library(speedglm)
+library(parallel)
+sessionInfo()
+
+```
+
+## Import Data 
+
+Load your data files into the global environment. The sample dataset should have the subjects as rows and the phenotypes/covariates as columns with the sample names set as the rownames() and not as a column. For this analysis, the phenotype of interest is BMI and the covariates must include race, age, sex, smoking status (never/past/current = 0/1/2), genetic-ancestry principal components(PCs) 1-10, and six estimated blood cell proportions (Mono, Gran, NK, Bcell, CD8T, and CD4T), and any other covariates that are necessary for the specific cohort/study being analysed. The sample dataset should only contain unrelated individuals with no missing data. Samples with phenotype/covariate values that are considered outliers (greater or less than four standard deviations from the mean) should be excluded. 
+
+The methylation dataset should have methylation sites (cpgs) as rows and subjects as columns and methylation M-values as the values in the cells with the cpg IDs set as the rownames and not as a column. Technical variation (site, batch, plate, well-position, etc) should be removed using the ComBat function from the sva R package, or another comparable surrogate variable method, prior to analysis. Additionally, methylation sites that are considered outliers (greater or less than four standard deviations from the mean), X/Y chromosome sites, and sites near common polymorphisms should be removed prior to running analysis.  
+
+Under each import line is a line that can be uncommented to set the sample-names/cpg-ID column to the rownames() if the datasets are not already structured in this way.
+
+```{r Import Data}
+# load sample data
+pheno <- fread("sample_file_name.txt")
+#pheno <- pheno %>% remove_rownames() %>% column_to_rownames(var = "sampleID-rowname")
+
+# load methylation data
+mvals <- fread("methylation_file_name.txt")
+#mvals <- mvals %>% remove_rownames() %>% column_to_rownames(var = "cpgID-rowname")
+
+```
+
+
+## Data checks
+
+
+This step is to ensure that the methylation dataset only includes the subjects in the sample dataset and that the subjects are in the same order in both datasets.
+
+
+```{r Data Checks}
+# Subset methylation data to only the samples present in 'pheno'
+mvals <- mvals[ ,colnames(mvals) %in% rownames(pheno)]
+
+# Order the sample and methylation data by sample name
+pheno <- pheno[order(rownames(pheno)), ]
+mvals <- mvals[ ,order(colnames(mvals)) ]
+
+# Check that the order is the same. The order.test object will be TRUE if they are the same and FALSE if they are not. If the order is not the same, double check that the value types are the same for rownames(pheno) and colnames(mvals) or if the import method used created double-quoted strings.
+order.test <- identical(rownames(pheno), colnames(mvals))
+order.test
+
+```
+
+
+## Subset by Race/Ethnicity
+
+
+This step will subset your sample and methylation datasets by the values in the race/ethnicity column in the sample dataset. Please note that each unique value for race/ethnicity will become a subset with the value as the subset name, so it may be beneficial to change from dummy variables to more informative strings. 
+
+
+```{r race/ethnicity subset}
+# Create a key to subset data by subject race/ethnicity. 
+subset.key <- pheno %>% 
+  dplyr::select("race1c") # replace with the race/ethnicity column name in your dataset
+subset.key <- subset.key %>% rownames_to_column("sample.ids")
+
+subset.key <- split(subset.key, f = list(subset.key$"race1c")) # replace with the race/ethnicity column name in your dataset
+subset.key <- lapply(subset.key, function(i){
+  ids = i$"sample.ids"
+  return(ids)
+})
+
+# Subset methylation data
+mvals.subs <- lapply(subset.key, function(i){
+  df.sub = mvals[,colnames(mvals) %in% i]
+  df.sub <- df.sub[,order(colnames(df.sub))]
+  df.sub <- as.data.frame(df.sub)
+  return(df.sub)
+})
+names(mvals.subs) <- names(subset.key)
+
+# Subset phenotype data
+pheno.subs <- lapply(subset.key, function(i){
+  df.sub = pheno[rownames(pheno) %in% i,]
+  df.sub <- df.sub[order(rownames(df.sub)),]
+  df.sub <- df.sub %>% mutate("total" = length(df.sub))
+  return(df.sub)
+})
+names(pheno.subs) <- names(subset.key)
+
+rm(pheno) # remove unneccessary objects
+gc() # free up memory
+
+```
+
+
+## Chunk Data
+
+In this step, the methylation subsets are divided into even smaller subsets to reduce memory load and computation time in the analysis step.
+
+```{r Chunk Data}
+# Set parameters for creating chunks of n cpgs. This will create a list comprised of n-sized subsets and a subset with the remainder that was not divisible by n.
+n <- 1000 # number of cpgs per subset
+nr <- as.numeric(nrow(mvals)) # total number of cpgs 
+rm(mvals)
+gc()
+
+# function to create a list of equal-sized chunks + one chunk with the remainder
+chunk <- rep(seq_len(ceiling(nr/n)),each = n,length.out = nr) 
+
+# Chunk the methylation data for each race/ethnicity subset
+mvals.chunked <- list()
+for(i in 1:length(mvals.subs)){
+  name <- names(subset.key)[i]
+  subset <- mvals.subs[[name]]
+  chunks <- split(subset, f = chunk)
+  chunks <- lapply(chunks, function(df){
+    tdf <- as.data.frame(t(df))
+    return(tdf)
+    })
+  mvals.chunked[[name]] <- chunks
+}
+
+rm(mvals.subs, chunks, subset)
+gc()
+
+```
+
+
+# Run linear regressions
+
+The below section will perform a linear regression for each cpg site. Please modify the phenotype and covariate names in the model (lines 164-167) to match those of your dataset.
+
+The following function is optimized to reduce the amount of memory used in the process. To reduce runtime you can do the following: 1) remove the broom::tidy and subsequent steps from the run_ewas function and create a separate function, then use the output from the run_ewas function as the input for the broom::tidy function you created. 2) reduce the size of the dataframe subsets by changing the 'n' variable to a smaller number (~1000 should be sufficient) 3) Uncomment the first four lines of the code chunk and modify the number of cores to use in parallel processing, then change the first map in the first 'linreg' pipeline to future_map and add the .options parameter as seen in the second 'linreg' pipeline.
+
+
+```{r Run Linear Regressions}
+# # Set the parallel processing parameters
+# future::plan(multisession)
+# availableCores(methods = "mc.cores")
+# options(mc.cores=2, seed = T)
+
+# Function to perform linear regressions. 
+run_ewas <- function(df){
+  # Run linear regressions
+  linreg <- df %>%
+      dplyr::select(one_of(colnames(df))) %>%
+      map(~ speedglm::speedlm(.x ~ bmi1c +
+              age1c + gender1 + as.factor(cig1c) + V1 + V2
+            + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + CD8T
+            + CD4T + NK + Mono + Gran + Bcell, data = p)) %>% # change the model to match the phenotype and covariate column names in your dataset
+      map(~ broom::tidy(.x , conf.int = TRUE)) %>%
+      map(~ .x %>% dplyr::filter(term %in% c( 'bmi1c'))) # change to the BMI column name in your dataset
+  gc()
+  linreg <- linreg %>% future_map_dfr(~.x, .id = 'cpgid', .options = furrr_options(seed = TRUE))
+  return(linreg)
+  gc()
+}
+
+# Loop through the list of race/ethnicity subsets (first for-loop) and the list of methylation chunks (second for-loop) to perform linear regressions 
+tic()
+bmi_ewas <- list()
+base::suppressMessages(for(i in 1:length(mvals.chunked)){
+  tic()
+  name <- names(subset.key)[i]
+  p <- pheno.subs[[name]]
+  m <- mvals.chunked[[name]]
+  cat("Starting subset: ", name, "\n")
+  sub.res <- list()
+  for(j in 1:length(m)){
+    sub.res[[j]] <- run_ewas(m[[j]])
+    }
+  sub.res <- rbindlist(sub.res)
+  sub.res <- sub.res %>% mutate(total = nrow(p))
+  bmi_ewas[[name]] <- sub.res
+  cat("Finished with subset: ", name, "\n")
+  toc()
+  save(bmi_ewas, file = "file.txt")
+  gc()
+})
+toc()
+
+rm(m, p, pheno, sub.res, subset, chunk, mvals.chunked, pheno.subs, i, j, n, nr)
+gc()
+
+```
+
+
+## Export Data
+
+
+```{r Save Files}
+# Save files as .csv for input to METAL for meta-analysis
+for(i in 1:length(bmi_ewas)){
+  study <- "study_name" # replace with the name of the study you perfomred the analysis on
+  name <- names(bmi_ewas)[i]
+  subset <- bmi_ewas[[name]]
+  # Add a column with the sample size for each subset
+  file_name <- paste0(study, "_", name, "_bmi_ewas.csv")
+  fwrite(subset, file = file_name, sep = ",")
+}
+
+```
+
+
+
+

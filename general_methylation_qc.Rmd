@@ -24,7 +24,7 @@ sessionInfo()
 
 ## Import Data
 
-Import the JHS methylation M-values that have been adjusted for any batch, plate, and plate position affects with the ComBat function in the sva R package.
+Import the methylation M-values that have been adjusted for any batch, plate, and plate position affects.
 
 ```{r Import Methylation Data}
 # Import R object for JHS methylation batch-adjusted M-values
@@ -47,7 +47,7 @@ Import the list of common polymorphic sites in African-Americans and remove thes
 # Import the list of polymorphic sites to be removed from downstream analysis
 ListRemoveProbes <- read.csv("~/lange_lab/JHS/Methylation/pheno_data/ListRemoveProbesAfrGeneral2.csv", stringsAsFactors = F)
 
-# Save just the CpG identifiers from the ListRemoveProber for input into GLINT for exclusion after inference of population structure.
+# Save just the CpG identifiers from the ListRemoveProber.
 aa_polymorphic_sites <- ListRemoveProbes$probeID
 
 # Remove polymorphic sites from methylation data

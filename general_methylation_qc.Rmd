@@ -1,0 +1,125 @@
+---
+title: "EWAS Preprocessing"
+author: "Kendra Ferrier"
+date: "`r format(Sys.time(), '%m/%d/%y')`"
+output:
+  html_document:
+    theme: cosmo
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = "hide")
+library(tidyr)
+library(tidyverse)
+library(haven)
+library(dplyr)
+library(tibble)
+library(readr)
+library(data.table)
+library(sesame)
+library(limma)
+sessionInfo()
+```
+
+## Import Data
+
+Import the JHS methylation M-values that have been adjusted for any batch, plate, and plate position affects with the ComBat function in the sva R package.
+
+```{r Import Methylation Data}
+# Import R object for JHS methylation batch-adjusted M-values
+load("~/lange_lab/JHS/Methylation/ComBat_v2/par_combat_adj_mvals.RData")
+mvals <- data.frame(combat_adj_methyl) #covert to dataframe and rename for convenience
+rm(combat_adj_methyl) # remove unneccesary objects
+gc() # garbage collect to free up memory 
+
+
+```
+
+
+## Subset and Filter Data
+
+
+Import the list of common polymorphic sites in African-Americans and remove these sites from the methylation data
+
+
+```{r Polymorphic Sites, eval=FALSE}
+# Import the list of polymorphic sites to be removed from downstream analysis
+ListRemoveProbes <- read.csv("~/lange_lab/JHS/Methylation/pheno_data/ListRemoveProbesAfrGeneral2.csv", stringsAsFactors = F)
+
+# Save just the CpG identifiers from the ListRemoveProber for input into GLINT for exclusion after inference of population structure.
+aa_polymorphic_sites <- ListRemoveProbes$probeID
+
+# Remove polymorphic sites from methylation data
+mvals <- mvals[!rownames(mvals) %in% aa_polymorphic_sites,]
+
+# Remove the full methylation dataset from the global environment
+rm(ListRemoveProbes, aa_polymorphic_sites)
+gc()
+
+```
+
+
+Additionally, import the EPIC methylation site annotation file (including information on masking) and remove potentially problematic probes. Also included is code for removal of X/Y chromosome probes and probes that have a standard deviation less than 0.01 (low variation).
+
+
+```{r Problematic Sites, eval=FALSE}
+# Drop probes that have mapping issues
+mask_mapping <- annotation[annotation$MASK_mapping == T,]
+mvals <- mvals[!rownames(mvals) %in% mask_mapping$probeID,]
+
+# Drop probes that are cross-reactive
+xreactive <- annotation[annotation$MASK_sub30_copy == T,]
+mvals <- mvals[!rownames(mvals) %in% xreactive$probeID,]
+
+# Drop probes that are Type 1 with putative color-channel switching (CCS) SNPs
+ccs <- annotation[annotation$MASK_typeINextBaseSwitch == T,]
+mvals <- mvals[!rownames(mvals) %in% ccs$probeID,]
+
+# Drop probes that have an extension base inconsistent with specified color channel (type-I) or CpG (type-II) based on mapping
+ext <- annotation[annotation$MASK_extBase == T,]
+mvals <- mvals[!rownames(mvals) %in% ext$probeID,]
+
+# Keep only probes that target cpgs. Probe types can target CpGs, CHGs, or SNPs (labeled as "cg", "ch", and "rs", respectively in the annotation probeType column)
+target <- annotation[annotation$probeType == "cg", ]
+mvals <- mvals[rownames(mvals) %in% target$probeID,]
+
+# Drop all probes that are less than 5bp from a polymorphic site and have a MAF < 1%
+less.than.5bp <- poly_probes[poly_probes$count_snv_within_5bp != 0 | poly_probes$count_snv_within_5bp != NA,]
+maf.greater.than.1 <- separate(poly_probe_lvls, probe, c("A", "B", "C", "D"), sep = ";", extra = "drop", fill = "right") # The probe column contains a string with up to 4 CpGs listed together separated by ';', this step separates the CpGs into different columns so that there is only 1 cpg per cell.
+maf.greater.than.1 <- c(maf.greater.than.1$A, maf.greater.than.1$B,maf.greater.than.1$C,maf.greater.than.1$D) # create a list of all the cpgs by combining all of the columns with cpg names
+maf.greater.than.1 <- unique(maf.greater.than.1[!is.na(maf.greater.than.1)]) # remove all NA and duplicate values
+less.than.5bp <- less.than.5bp[less.than.5bp$probeID %in% maf.greater.than.1,] 
+
+mvals <- mvals[!rownames(mvals) %in% less.than.5bp$probeID,]
+
+# Drop X/Y chromosome probes 
+xy <- annotation %>% filter(CpG_chrm == "chrX" | CpG_chrm == "chrY")
+mvals <- mvals[!rownames(mvals) %in% xy$probeID,]
+
+# Drop CpGs with a standard deviation less than 0.01 
+sd <- apply(mvals, 1, sd)
+mvals <- mvals[sd >= 0.01,]
+# There are 0 CpGs with a sd less than 0.01 after all previous filtering
+
+```
+
+
+Other general filtering/subsetting criteria that was not included in this code are:
+Filter out sites with a detection p-value > 0.01 by setting them to NA and then removing rows containing NAs
+Keep only probes with a call rate >= 90% 
+Remove duplicate samples
+Keep only unrelated samples
+
+
+## Export Data
+
+Save dataframe as an .RData file.
+
+```{r Save Files, eval=False}
+# Save dataframe
+save(mvals, file = "mvalues_combat-adj_cleaned.RData")
+
+```
+
+

@@ -64,6 +64,10 @@ Additionally, import the EPIC methylation site annotation file (including inform
 
 
 ```{r Problematic Sites, eval=FALSE}
+# Import methylation site annotation file
+annotation <- fread("https://zhouserver.research.chop.edu/InfiniumAnnotation/20180909/EPIC/EPIC.hg38.manifest.tsv.gz") %>%
+  select(probeID, MASK_mapping, MASK_sub30_copy, MASK_typeINextBaseSwitch, MASK_extBase, probeType, CpG_chrm)
+  
 # Drop probes that have mapping issues
 mask_mapping <- annotation[annotation$MASK_mapping == T,]
 mvals <- mvals[!rownames(mvals) %in% mask_mapping$probeID,]
